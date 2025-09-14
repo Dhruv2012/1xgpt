@@ -370,15 +370,15 @@ def main():
         eval_dataset.metadata["s"] = 32
         train_dataset.metadata["vocab_size"] = 64000
         eval_dataset.metadata["vocab_size"] = 64000
-    else:
-        if "s" not in train_dataset.metadata:
-            train_dataset.metadata["s"] = 16
-        if "s" not in eval_dataset.metadata:
-            eval_dataset.metadata["s"] = 16
-        if "vocab_size" not in train_dataset.metadata:
-            train_dataset.metadata["vocab_size"] = 262144
-        if "vocab_size" not in eval_dataset.metadata:
-            eval_dataset.metadata["vocab_size"] = 262144
+    # else:
+    #     if "s" not in train_dataset.metadata:
+    #         train_dataset.metadata["s"] = 16
+    #     if "s" not in eval_dataset.metadata:
+    #         eval_dataset.metadata["s"] = 16
+    #     if "vocab_size" not in train_dataset.metadata:
+    #         train_dataset.metadata["vocab_size"] = 262144
+    #     if "vocab_size" not in eval_dataset.metadata:
+            # eval_dataset.metadata["vocab_size"] = 262144
     assert all(train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
                for shared_key in ("s", "vocab_size", "hz"))
 
@@ -442,10 +442,10 @@ def main():
             config.num_factored_vocabs = 3
             config.factored_vocab_size = 64000
             config.image_vocab_size = 64000  # also used for mask token id
-        else:
-            # v1.1 MAGVIT2: 2 groups × 512 per group (2^18 factorized as 2 × 2^9)
-            config.num_factored_vocabs = getattr(config, "num_factored_vocabs", 2)
-            config.factored_vocab_size = getattr(config, "factored_vocab_size", 512)
+        # else:
+        #     # v1.1 MAGVIT2: 2 groups × 512 per group (2^18 factorized as 2 × 2^9)
+        #     config.num_factored_vocabs = getattr(config, "num_factored_vocabs", 2)
+        #     config.factored_vocab_size = getattr(config, "factored_vocab_size", 512)
         
         model = STMaskGIT(config)
 
@@ -474,7 +474,7 @@ def main():
     collate_fn = default_data_collator if args.llama_config is not None else get_maskgit_collator(config)
     train_dataloader = DataLoader(
         train_dataset, shuffle=True, collate_fn=collate_fn,
-        batch_size=args.per_device_train_batch_size, num_workers=4, pin_memory=True,
+        batch_size=args.per_device_train_batch_size, num_workers=1, pin_memory=True,
     )
 
     # Shuffle eval dataset and then set shuffle=False on the dataloader.

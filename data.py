@@ -54,7 +54,6 @@ class RawTokenDataset(TorchDataset):
             self.S = s * s
 
         else:
-            
             # ---------------- v2 (sharded; Cosmos DV8x8x8) ----------------
             # Layout:
             #   - Each shard: videos/video_{shard}.bin contains DV clip tokens with shape
@@ -118,10 +117,23 @@ class RawTokenDataset(TorchDataset):
                 if s0 == s1:
                     self.valid_start_inds.append(start_clip)
         else:
+            # Build start indices (v1) with original semantics
             for start_ind in range(len(self.data) - self.video_len):
                 if not (filter_interrupts and self.segment_ids[start_ind] != self.segment_ids[start_ind + self.video_len]):
-                    if not filter_overlaps or (self.segment_ids[start_ind] != self.segment_ids[start_ind + self.stride]):
-                        self.valid_start_inds.append(start_ind)
+                    self.valid_start_inds.append(start_ind)
+
+            if filter_overlaps:
+                # Ensure each frame appears at most once (original greedy subset)
+                filtered_start_inds = []
+                for start_ind in self.valid_start_inds:
+                    overlapping_start_inds = {start_ind - i * self.stride for i in range(1, self.window_size)}
+                    # Exclude if any overlapping start has already been used
+                    for existing_start_ind in filtered_start_inds[-self.window_size * self.stride:]:
+                        if existing_start_ind in overlapping_start_inds:
+                            break
+                    else:
+                        filtered_start_inds.append(start_ind)
+                self.valid_start_inds = filtered_start_inds
 
     def _get_shard_idx(self, clip_idx: int) -> int:
         for i in range(len(self.shard_cumulative_clips) - 1):
@@ -129,7 +141,6 @@ class RawTokenDataset(TorchDataset):
                 return i
         return len(self.shard_cumulative_clips) - 2
 
-    
     def _load_shard_data(self, shard_idx: int):
         if not getattr(self, "is_sharded", False):
             return
@@ -171,7 +182,7 @@ class RawTokenDataset(TorchDataset):
         self._load_shard_data(shard_idx)
         in_shard_clip = global_clip_idx - self.shard_cumulative_clips[shard_idx]
         q = self.current_shard_data[in_shard_clip]  # (3, 32, 32)
-        V = 64000  # per-codebook size
+        V = self.factored_vocab_size  # FIX: use configured base instead of hard-coded 64000
         # fuse q0,q1,q2 into a single integer per (h,w)
         fused = (q[0].astype(np.int64) + q[1].astype(np.int64) * V + q[2].astype(np.int64) * (V * V))
         return fused  # (32, 32)
