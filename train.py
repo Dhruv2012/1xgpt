@@ -361,6 +361,24 @@ def main():
                                                                          * accelerator.num_processes]
         eval_dataset = train_dataset
 
+    # breakpoint() removed
+    
+    # Ensure metadata keys exist (v2 does not include s/vocab_size in metadata)
+    if getattr(train_dataset, "is_sharded", False):
+        # v2.0: Cosmos DV8x8x8
+        train_dataset.metadata["s"] = 32
+        eval_dataset.metadata["s"] = 32
+        train_dataset.metadata["vocab_size"] = 64000
+        eval_dataset.metadata["vocab_size"] = 64000
+    else:
+        if "s" not in train_dataset.metadata:
+            train_dataset.metadata["s"] = 16
+        if "s" not in eval_dataset.metadata:
+            eval_dataset.metadata["s"] = 16
+        if "vocab_size" not in train_dataset.metadata:
+            train_dataset.metadata["vocab_size"] = 262144
+        if "vocab_size" not in eval_dataset.metadata:
+            eval_dataset.metadata["vocab_size"] = 262144
     assert all(train_dataset.metadata[shared_key] == eval_dataset.metadata[shared_key]
                for shared_key in ("s", "vocab_size", "hz"))
 
@@ -417,6 +435,18 @@ def main():
         config.image_vocab_size = vocab_size
         config.T = args.window_size
         config.S = latent_side_len**2
+        
+        # Factorization settings:
+        if getattr(train_dataset, "is_sharded", False):
+            # v2 Cosmos DV: 3 groups × 64k per group
+            config.num_factored_vocabs = 3
+            config.factored_vocab_size = 64000
+            config.image_vocab_size = 64000  # also used for mask token id
+        else:
+            # v1.1 MAGVIT2: 2 groups × 512 per group (2^18 factorized as 2 × 2^9)
+            config.num_factored_vocabs = getattr(config, "num_factored_vocabs", 2)
+            config.factored_vocab_size = getattr(config, "factored_vocab_size", 512)
+        
         model = STMaskGIT(config)
 
         if args.mu_transfer:

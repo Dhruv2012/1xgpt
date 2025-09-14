@@ -3,6 +3,7 @@ import math
 import os
 import random
 from pathlib import Path
+from typing import Optional, List, Tuple
 
 import numpy as np
 import torch
@@ -15,7 +16,7 @@ from genie.st_mask_git import cosine_schedule
 
 
 class RawTokenDataset(TorchDataset):
-    """ Loads raw uint32 tokens as memmap-backed array """
+    """ Loads raw tokens as memmap-backed array (v1 single-file) or sharded (v2.0). """
     def __init__(
         self,
         data_dir,
@@ -24,80 +25,172 @@ class RawTokenDataset(TorchDataset):
         filter_interrupts=True,
         filter_overlaps=False
     ):
-        """
-        Args:
-            data_dir: directory with the same format as `data/train_v0` and `data/val_v0`.
-                Notably, has `video.bin` and `metadata.json`
-            window_size: number of frames per "video" sequence
-            stride: frame skip
-            filter_interrupts: Under 3% of training frame sequences are the concatenation of two different clips.
-                If filter_interrupts is True, will filter out these sequences using the segment ids.
-            filter_overlaps: If False (default), one frame will appear in multiple examples;
-                e.g. frame 0 might appear as the first frame in example 0 and also the second frame in example 15.
-                If True, will filter out examples so that each frame appears at most once in the dataset.
-        """
         data_dir = Path(data_dir)
         with open(data_dir / "metadata.json") as f:
             self.metadata = json.load(f)
 
-        shape = (self.metadata["num_images"], self.metadata["s"], self.metadata["s"])
-        video_tokens_path, segment_ids_path, action_tokens_path = [data_dir / f"{name}.bin"
-                                                                   for name in ["video", "segment_ids", "actions"]]
-        token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
-        self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
-        # self.actions = np.memmap(action_tokens_path, dtype=np.uint16, mode="r", shape=(self.metadata["num_images"],))
+        self.num_shards = 0
+        video_bin_path = data_dir / "video.bin"
+        if video_bin_path.exists():
+            # ---------------- v1 (authors' original logic) ----------------
+            self.is_sharded = False
 
-        if os.path.isfile(segment_ids_path):
-            self.segment_ids = np.memmap(
-                segment_ids_path,
-                dtype=np.int32,
-                mode="r",
-                shape=(self.metadata["num_images"],)
-            )
+            shape = (self.metadata["num_images"], self.metadata["s"], self.metadata["s"])
+            video_tokens_path, segment_ids_path, action_tokens_path = [data_dir / f"{name}.bin"
+                                                                       for name in ["video", "segment_ids", "actions"]]
+            token_dtype = np.dtype(self.metadata.get("token_dtype", "uint32"))
+            self.data = np.memmap(video_tokens_path, dtype=token_dtype, mode="r", shape=shape)
+
+            if os.path.isfile(segment_ids_path):
+                self.segment_ids = np.memmap(
+                    segment_ids_path, dtype=np.int32, mode="r", shape=(self.metadata["num_images"],)
+                )
+            else:
+                self.segment_ids = None
+                if filter_interrupts:
+                    raise NotImplementedError("Cannot filter interrupted sequences without segment ids.")
+
+            s = int(self.metadata["s"])
+            self.S = s * s
+
         else:
-            self.segment_ids = None
-            if filter_interrupts:
-                raise NotImplementedError("Cannot filter interrupted sequences without segment ids.")
+            
+            # ---------------- v2 (sharded; Cosmos DV8x8x8) ----------------
+            # Layout:
+            #   - Each shard: videos/video_{shard}.bin contains DV clip tokens with shape
+            #       (num_clips, 3, 32, 32), dtype=int32
+            #   - One clip = 17 frames @ 30Hz (fixed DV window)
+            #   - Segment ids remain frame-level: segment_idx_{shard}.bin (int32, shape=(num_frames,))
+            self.is_sharded = True
+            self.data_dir = data_dir
+            self.videos_dir = data_dir / "videos"
+            self.segment_indices_dir = data_dir / "segment_indices"
 
-        self.window_size, self.stride = window_size, stride
-        # Number of frames between the first and last frames of a video sequence (excluding one endpoint frame)
-        self.video_len = (self.window_size - 1) * self.stride
+            # Cosmos DV constants
+            self.frames_per_clip = 17
+            self.spatial_side = 32
+            self.num_groups = 3
+            self.factored_vocab_size = 64000
+            self.S = self.spatial_side * self.spatial_side
+            self.token_dtype = np.dtype("int32")
+
+            # Load per-shard metadata and compute clip counts
+            self.shard_metadata: List[dict] = []
+            self.shard_cumulative_clips: List[int] = [0]
+            metadata_dir = data_dir / "metadata"
+            shard_idx = 0
+            while (metadata_dir / f"metadata_{shard_idx}.json").exists():
+                with open(metadata_dir / f"metadata_{shard_idx}.json") as f:
+                    m = json.load(f)
+                if "shard_num_frames" not in m:
+                    raise ValueError(f"metadata_{shard_idx}.json missing 'shard_num_frames'")
+                frames = int(m["shard_num_frames"])
+                clips = (frames + self.frames_per_clip - 1) // self.frames_per_clip
+                m["_num_clips"] = clips
+                self.shard_metadata.append(m)
+                self.shard_cumulative_clips.append(self.shard_cumulative_clips[-1] + clips)
+                shard_idx += 1
+            self.num_shards = len(self.shard_metadata)
+            if self.num_shards == 0:
+                raise ValueError(f"v2: no shard metadata found in {metadata_dir}")
+            self.total_clips = self.shard_cumulative_clips[-1]
+
+            # Holders
+            self.current_shard_idx = -1
+            self.current_shard_data = None  # (clips, 3, 32, 32)
+            self.current_shard_segment_ids = None
+
+        # ---------------- common init ----------------
+        self.window_size, self.stride = window_size, stride  # in CLIPS for v2
+        self.video_len = (self.window_size - 1) * self.stride  # measured in clips
 
         self.valid_start_inds = []
-        for start_ind in range(len(self.data) - self.video_len):
-            # Assuming `segment_ids` is monotonically increasing, a sequence is interrupted
-            # if the first and last frames have different segment ids.
-            if not (filter_interrupts and self.segment_ids[start_ind] != self.segment_ids[start_ind + self.video_len]):
-                self.valid_start_inds.append(start_ind)
+        if getattr(self, "is_sharded", False):
+            # Build start indices over clips
+            total = self.total_clips
+            for start_clip in range(0, total - self.video_len):
+                if not filter_interrupts or not self.segment_indices_dir.exists():
+                    self.valid_start_inds.append(start_clip)
+                    continue
+                # conservative: require the first-frame segment id to match across window
+                s0 = self._clip_segment_id(start_clip)
+                s1 = self._clip_segment_id(start_clip + self.video_len)
+                if s0 == s1:
+                    self.valid_start_inds.append(start_clip)
+        else:
+            for start_ind in range(len(self.data) - self.video_len):
+                if not (filter_interrupts and self.segment_ids[start_ind] != self.segment_ids[start_ind + self.video_len]):
+                    if not filter_overlaps or (self.segment_ids[start_ind] != self.segment_ids[start_ind + self.stride]):
+                        self.valid_start_inds.append(start_ind)
 
-        if filter_overlaps:
-            # Instead of using a sliding window, use each frame at most once
-            filtered_start_inds = []
-            for start_ind in self.valid_start_inds:
-                overlapping_start_inds = {start_ind - i * self.stride for i in range(1, self.window_size)}
-                # all sequences from `overlapping_start_inds` will also contain `start_ind`,
-                # so exclude sequence starting from `start_ind` if any of `overlapping_start_inds` is already being used
-                for existing_start_ind in filtered_start_inds[-self.window_size * self.stride:]:
-                    # Bound could be improved
-                    if existing_start_ind in overlapping_start_inds:
-                        break
-                else:
-                    filtered_start_inds.append(start_ind)
+    def _get_shard_idx(self, clip_idx: int) -> int:
+        for i in range(len(self.shard_cumulative_clips) - 1):
+            if self.shard_cumulative_clips[i] <= clip_idx < self.shard_cumulative_clips[i + 1]:
+                return i
+        return len(self.shard_cumulative_clips) - 2
 
-            self.valid_start_inds = filtered_start_inds
+    
+    def _load_shard_data(self, shard_idx: int):
+        if not getattr(self, "is_sharded", False):
+            return
+        if self.current_shard_idx == shard_idx:
+            return
+        # Map DV clips: (num_clips, 3, 32, 32), dtype=int32
+        video_path = self.videos_dir / f"video_{shard_idx}.bin"
+        num_clips = self.shard_metadata[shard_idx]["_num_clips"]
+        self.current_shard_data = np.memmap(
+            video_path, dtype=np.int32, mode="r", shape=(num_clips, self.num_groups, self.spatial_side, self.spatial_side)
+        )
+        # Segment ids: per-frame (optional)
+        if self.segment_indices_dir.exists():
+            seg_path = self.segment_indices_dir / f"segment_idx_{shard_idx}.bin"
+            if seg_path.exists():
+                frames = int(self.shard_metadata[shard_idx]["shard_num_frames"])
+                self.current_shard_segment_ids = np.memmap(seg_path, dtype=np.int32, mode="r", shape=(frames,))
+            else:
+                self.current_shard_segment_ids = None
+        else:
+            self.current_shard_segment_ids = None
+        self.current_shard_idx = shard_idx
 
+    def _clip_segment_id(self, global_clip_idx: int) -> int:
+        """Return segment id of the *first frame* of the clip (for filtering)."""
+        if not self.segment_indices_dir.exists():
+            return 0
+        shard_idx = self._get_shard_idx(global_clip_idx)
+        self._load_shard_data(shard_idx)
+        in_shard_clip = global_clip_idx - self.shard_cumulative_clips[shard_idx]
+        start_frame = in_shard_clip * self.frames_per_clip
+        if self.current_shard_segment_ids is None:
+            return 0
+        return int(self.current_shard_segment_ids[min(start_frame, len(self.current_shard_segment_ids)-1)])
+
+    def _read_clip(self, global_clip_idx: int) -> np.ndarray:
+        """Read fused token grid for a single DV clip -> (32, 32) int64."""
+        shard_idx = self._get_shard_idx(global_clip_idx)
+        self._load_shard_data(shard_idx)
+        in_shard_clip = global_clip_idx - self.shard_cumulative_clips[shard_idx]
+        q = self.current_shard_data[in_shard_clip]  # (3, 32, 32)
+        V = 64000  # per-codebook size
+        # fuse q0,q1,q2 into a single integer per (h,w)
+        fused = (q[0].astype(np.int64) + q[1].astype(np.int64) * V + q[2].astype(np.int64) * (V * V))
+        return fused  # (32, 32)
+
+    # -------- Torch Dataset API --------
     def __len__(self):
         return len(self.valid_start_inds)
 
     def __getitem__(self, idx):
-        """
-        Returns a flattened sequence of tokens representing `self.window_size` frames,
-        spaced `self.stride` apart.
-        """
         start_ind = self.valid_start_inds[idx]
-        x = torch.from_numpy((self.data[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64))
-        x = x.flatten()
-
+        if getattr(self, "is_sharded", False):
+            T = self.window_size
+            clips = [self._read_clip(start_ind + k * self.stride) for k in range(T)]  # list of (32,32)
+            x = torch.from_numpy(np.stack(clips, axis=0).astype(np.int64))  # (T, 32, 32)
+        else:
+            x = torch.from_numpy(
+                (self.data[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64)
+            )  # (T, s, s)
+        x = x.flatten()  # (T*S,), S=1024 for v2
         attention_mask = torch.ones_like(x)
         return {
             "input_ids": x,
