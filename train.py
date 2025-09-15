@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument(
         "--window_size",
         type=int,
-        default=16,
+        default=1,
         help="Number of frames to in a sequence.",
     )
     parser.add_argument(
@@ -368,8 +368,8 @@ def main():
         # v2.0: Cosmos DV8x8x8
         train_dataset.metadata["s"] = 32
         eval_dataset.metadata["s"] = 32
-        train_dataset.metadata["vocab_size"] = 64000
-        eval_dataset.metadata["vocab_size"] = 64000
+        train_dataset.metadata["vocab_size"] = 65536
+        eval_dataset.metadata["vocab_size"] = 65536
     # else:
     #     if "s" not in train_dataset.metadata:
     #         train_dataset.metadata["s"] = 16
@@ -433,15 +433,18 @@ def main():
         config = GenieConfig.from_pretrained(args.genie_config)
         config.use_mup = args.mu_transfer  # Note: changing this may affect pre-trained model due to attn scaling
         config.image_vocab_size = vocab_size
-        config.T = args.window_size
         config.S = latent_side_len**2
         
         # Factorization settings:
         if getattr(train_dataset, "is_sharded", False):
             # v2 Cosmos DV: 3 groups × 64k per group
-            config.num_factored_vocabs = 3
-            config.factored_vocab_size = 64000
-            config.image_vocab_size = 64000  # also used for mask token id
+            config.num_factored_vocabs = 1
+            config.factored_vocab_size = 65536
+            config.image_vocab_size = 65536 + 1  # also used for mask token id
+            config.T = args.window_size * train_dataset.num_groups
+        else:
+            config.T = args.window_size
+
         # else:
         #     # v1.1 MAGVIT2: 2 groups × 512 per group (2^18 factorized as 2 × 2^9)
         #     config.num_factored_vocabs = getattr(config, "num_factored_vocabs", 2)
@@ -555,7 +558,7 @@ def main():
     # The trackers initialize automatically on the main process.
     experiment_config = vars(args) | vars(config)
 
-    seq_len = latent_side_len**2 * args.window_size
+    seq_len = latent_side_len**2 * config.T
     effective_batch_size = args.per_device_train_batch_size * args.gradient_accumulation_steps \
                            * accelerator.num_processes
 
@@ -637,6 +640,7 @@ def main():
 
         _time = time.time()
         for step, batch in enumerate(active_dataloader):
+            breakpoint()
             batch_size = batch["input_ids"].size(0)
             # Manual gradient accumulation because accelerator somehow taking a lot of memory
             is_update_step = (step + 1) % args.gradient_accumulation_steps == 0
@@ -749,9 +753,9 @@ def main():
 
             if completed_steps % args.vis_every_n_steps == 0:
                 if not args.overfit_first_batch:  # val is same as train otherwise
-                    visualize(accelerator, model, eval_dataloader, args.window_size, "val")
+                    visualize(accelerator, model, eval_dataloader, config.T, "val")
 
-                visualize(accelerator, model, train_dataloader, args.window_size, "train")
+                visualize(accelerator, model, train_dataloader, config.T, "train")
 
             if completed_steps >= args.max_train_steps:
                 break

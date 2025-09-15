@@ -69,7 +69,7 @@ class RawTokenDataset(TorchDataset):
             self.frames_per_clip = 17
             self.spatial_side = 32
             self.num_groups = 3
-            self.factored_vocab_size = 64000
+            self.factored_vocab_size = 65536
             self.S = self.spatial_side * self.spatial_side
             self.token_dtype = np.dtype("int32")
 
@@ -178,14 +178,16 @@ class RawTokenDataset(TorchDataset):
 
     def _read_clip(self, global_clip_idx: int) -> np.ndarray:
         """Read fused token grid for a single DV clip -> (32, 32) int64."""
+        # breakpoint()
         shard_idx = self._get_shard_idx(global_clip_idx)
         self._load_shard_data(shard_idx)
         in_shard_clip = global_clip_idx - self.shard_cumulative_clips[shard_idx]
         q = self.current_shard_data[in_shard_clip]  # (3, 32, 32)
         V = self.factored_vocab_size  # FIX: use configured base instead of hard-coded 64000
         # fuse q0,q1,q2 into a single integer per (h,w)
-        fused = (q[0].astype(np.int64) + q[1].astype(np.int64) * V + q[2].astype(np.int64) * (V * V))
-        return fused  # (32, 32)
+        # fused = (q[0].astype(np.int64) + q[1].astype(np.int64) * V + q[2].astype(np.int64) * (V * V))
+        # return fused  # (32, 32)
+        return (q.astype(np.int64)-1)
 
     # -------- Torch Dataset API --------
     def __len__(self):
@@ -193,10 +195,11 @@ class RawTokenDataset(TorchDataset):
 
     def __getitem__(self, idx):
         start_ind = self.valid_start_inds[idx]
+        print("start_ind", start_ind, "len(self.valid_start_inds)", len(self.valid_start_inds))
         if getattr(self, "is_sharded", False):
             T = self.window_size
             clips = [self._read_clip(start_ind + k * self.stride) for k in range(T)]  # list of (32,32)
-            x = torch.from_numpy(np.stack(clips, axis=0).astype(np.int64))  # (T, 32, 32)
+            x = torch.from_numpy(np.stack(clips, axis=0).astype(np.int64))  # (T*3, 32, 32)
         else:
             x = torch.from_numpy(
                 (self.data[start_ind : start_ind + self.video_len + 1 : self.stride]).astype(np.int64)
@@ -220,6 +223,7 @@ def get_maskgit_collator(config: GenieConfig):
 
         input_ids = torch.stack([ex["input_ids"] for ex in features])
         device = input_ids.device
+        print("t ", config.T, "h ", h, "w", w, "b ", len(features))
         x_THW = rearrange(input_ids, "b (t h w) -> b t h w", b=len(features), t=config.T,
                           h=h, w=w)
         x_THWC = factorize_token_ids(x_THW, config.num_factored_vocabs, config.factored_vocab_size)
